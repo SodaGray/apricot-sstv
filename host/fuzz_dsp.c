@@ -34,6 +34,7 @@ int main(int argc, char **argv)
     long wn = 0;
     s = sstv_new(rate);
     if (!s) return 1;
+    if (getenv("WEAK")) sstv_set_weak(s, 1);
     if (wf) { static const uint8_t z[44]; fwrite(z, 1, 44, wf); }
     while (total < target) {
         int kind = (int)(rnd() % 10), i;

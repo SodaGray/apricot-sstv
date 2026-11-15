@@ -1,6 +1,5 @@
-/* SPDX-License-Identifier: GPL-3.0-only */
 /* preview_app.c -- run the real sstv_app.c on the host: stub SDK with a
- * 240x432 framebuffer, a simulated capture DMA streaming an SSTV signal at
+ * 240x432 framebuffer, a simulated capture DMA streaming a Robot 36 WAV at
  * real-time pace, ~30 ms frames with jitter, scripted taps. Dumps the screen
  * (portrait framebuffer, as the iPod holds it) at a few moments and checks the
  * BMP the app saves. Usage: preview_app photo.ppm outdir */
@@ -15,8 +14,10 @@
 #include <string.h>
 #include <math.h>
 #include <time.h>
+#include <errno.h>
+#include <sys/stat.h>
 static double now_s(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return ts.tv_sec + ts.tv_nsec * 1e-9; }
-static double fsum_t; static long fn_t; static double ftop[8]; static long ftopf[8];
+static double fmax_t, fsum_t; static long fmax_f, fn_t; static double ftop[8]; static long ftopf[8];
 
 #define FW 240
 #define FH 432
@@ -48,6 +49,14 @@ uint32_t hb_time_uptime_ms(void) { return (uint32_t)(g_us / 1000); }
 void hb_trace_init(void) {}
 void hb_trace_log(const char *tag, uint32_t a, uint32_t b) { printf("  trace %-8s %u %u\n", tag, a, b); }
 static FILE *g_f; static char g_dir[256]; static char g_last[512];
+int hb_fs_mkdir(const char *p)
+{
+    char path[512];
+    struct stat st;
+    snprintf(path, sizeof path, "%s%s", g_dir, p);
+    if (mkdir(path, 0755) == 0) return 1;
+    return errno == EEXIST && stat(path, &st) == 0 && S_ISDIR(st.st_mode);
+}
 int hb_fs_stream_open(const char *p) { snprintf(g_last, sizeof g_last, "%s%s", g_dir, p); g_f = fopen(g_last, "wb"); return g_f != 0; }
 int hb_fs_stream_write(const void *b, uint32_t n) { return g_f && fwrite(b, 1, n, g_f) == n; }
 int hb_fs_stream_close(void) { int ok = g_f && fclose(g_f) == 0; g_f = 0; return ok; }
@@ -124,12 +133,20 @@ int main(int argc, char **argv)
     hb_raw_init(FW, FH);
     frame(&up);
     dump(argv[2], "ui_0_idle");
+    if (getenv("RXMODE")) {
+        static const int modes[] = {-1, 8, 12, 44, 40, 60, 56, 76, 93, 99, 95, 98, 96, 97, 94};
+        int i, wanted = atoi(getenv("RXMODE"));
+        for (i = 0; i < 15 && modes[i] != wanted; i++) { t = tap(377, 145); frame(&t); frame(&up); }
+        if (i == 15) return 2;
+        dump(argv[2], "ui_mode");
+    }
+    if (getenv("WEAK")) { t = tap(377, 222); frame(&t); frame(&up); }
     t0 = g_us; W = 0;
     t = tap(377, 175); frame(&t); frame(&up);   /* LISTEN */
     t = tap(360, 200); frame(&t); frame(&up);   /* REC (12 s raw capture) */
     for (f = 0; f < 200000; f++) {
         r = r * 1103515245u + 12345u;
-        g_us += 16000 + (r >> 8) % 15001;      /* 16..31 ms UI frames, as on the device */
+        g_us += 16000 + (r >> 8) % 15001;      /* apricot's 16..31 ms frames */
         run_dma();
         if (getenv("TAPS") && (r >> 4) % 400 == 0) {   /* random button presses (not Rotate) */
             static const int bx[5] = { 340, 377, 413, 350, 377 }, by[5] = { 200, 200, 200, 222, 175 };

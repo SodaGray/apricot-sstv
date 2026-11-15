@@ -157,6 +157,12 @@ enum { CT_V = 0, CT_U = 1 };            /* Robot 36: chroma carried by a line */
 typedef struct { uint32_t edge; } Pulse;      /* autosync: a sync's trailing edge */
 
 struct SstvRx {
+    const Mode *selected;
+    struct VisEnergy *ve;
+    int fed, weak;
+    float hp_b[2][3], hp_a[2][2], hp_z[2][2];
+    int absent_run, par_v_even, par_v_odd, par_phase, par_pending, par_j;
+    uint32_t sp_n, sp_ok; float sp_prev;
     int    in_rate, D;
     double Fs;                          /* tone (decimated) rate */
 
@@ -243,6 +249,8 @@ static inline float f_atan2(float y, float x)
 }
 
 static int iround(double x) { return (int)(x + (x >= 0 ? 0.5 : -0.5)); }
+
+#include "sstv_vis.h"
 
 /* ------------------------------------------------------------ ring access */
 static inline int sbit(const SstvRx *s, uint32_t i)
@@ -379,14 +387,24 @@ static void render_period(SstvRx *s, int k, double t)
         sample_chan(s, base, (float)(t + m->ch[c].t0 * Fs), (float)(m->ch[c].len * Fs),
                     w, s->chbuf[c]);
     if (m->color == CM_R36) {
+        /* Clear separators vote on global chroma parity. */
         float sep = 0, p, p1 = (float)(t + 0.1040 * Fs);
-        int ns = 0;
+        int ns = 0, phase, j;
         for (p = (float)(t + 0.1005 * Fs); p < p1; p += 1.0f) { sep += lvl_rel(s, base, p); ns++; }
         sep = ns ? sep / (float)ns : 128.0f;
-        s->ct[k] = (uint8_t)(sep < 80 ? CT_V : sep > 175 ? CT_U : ((k & 1) ? CT_U : CT_V));
+        if (!s->done[k] && (sep < 80 || sep > 175)) {       /* first drawing only: one vote a line */
+            if ((sep < 80) == !(k & 1)) s->par_v_even++; else s->par_v_odd++;
+        }
+        phase = s->par_v_odd > s->par_v_even;
+        s->ct[k] = (uint8_t)(((k + phase) & 1) ? CT_U : CT_V);
         memcpy(s->Y + k * R36_W, s->chbuf[0], R36_W);
         memcpy(s->C + k * R36_W, s->chbuf[1], R36_W);
         s->done[k] = 1;
+        if (phase != s->par_phase) {                         /* budget the parity redraw like a timing redraw */
+            s->par_phase = phase;
+            for (j = 0; j < R36_H; j++) if (s->done[j]) s->ct[j] = (uint8_t)(((j + phase) & 1) ? CT_U : CT_V);
+            s->par_pending = 1; s->par_j = 0;
+        }
         compose36(s, k - 1); compose36(s, k); compose36(s, k + 1);
     } else {
         const uint8_t *Y = 0, *Y2 = 0, *V = 0, *U = 0, *R = 0, *G = 0, *B = 0;
@@ -535,6 +553,12 @@ static int period_cost(const Mode *m) { return m->nch * mode_sw(m); }
 static void redraw_step(SstvRx *s, int budget)
 {
     int j;
+    if (s->par_pending) {
+        for (j = s->par_j; j < R36_H && budget > 0; j++, budget -= R36_W) compose36(s, j);
+        s->par_j = j;
+        if (j == R36_H) s->par_pending = 0;
+        s->revision++;
+    }
     if (!s->rd_pending) return;
     for (j = s->rd_j; j < s->k && j < s->nper && budget > 0; j++) {
         if (!period_in_ring(s, j)) continue;           /* too old: keeps its timing */
@@ -552,6 +576,8 @@ static void finish(SstvRx *s, int why)
     s->state = SSTV_IDLE;
     s->end_kind = why;
     s->t_end = s->n;
+    ve_reset(s->ve, s->n);
+    s->npulses = 0; s->cand = 0;
     s->can_resume = (why == SSTV_END_LOST || why == SSTV_END_ABORT) && s->k * 6 < s->nper * 5 && s->fit_n >= 4;
     if (s->k * 6 >= s->nper * 5) s->images++;
     if (s->k * 6 >= s->nper * 5 && s->fit_full && s->fit_n * 4 >= s->nper && s->fit_span * 2 >= s->nper) {
@@ -586,8 +612,10 @@ static void start_rx(SstvRx *s, const Mode *m, double t0, int kind, float off)
 {
     uint32_t need = (uint32_t)(mode_sw(m) * mode_sh(m));
     int k;
+    if (s->selected && m != s->selected) return;
     if (s->state == SSTV_RX) finish(s, SSTV_END_NEWVIS);
     s->m = m;
+    ve_reset(s->ve, s->n);
     if (off > 150) off = 150;
     if (off < -150) off = -150;
     s->off = off;
@@ -604,6 +632,9 @@ static void start_rx(SstvRx *s, const Mode *m, double t0, int kind, float off)
     s->t_ref = t0; s->fa = 0; s->fb = s->Pprior;
     s->fit_n = s->fit_span = s->fit_full = 0;
     s->k = 0; s->miss_run = 0; s->sync_good = s->sync_seen = 0; s->redraws = 0;
+    s->absent_run = 0; s->sp_n = s->sp_ok = 0;
+    s->par_v_even = s->par_v_odd = s->par_phase = 0;
+    s->par_pending = s->par_j = 0;
     s->rd_pending = 0; s->rd_j = 0;
     for (k = 0; k < MAXP; k++) { s->mgood[k] = 0; s->done[k] = 0; }
     memset(s->img, 0, need * sizeof *s->img);
@@ -615,12 +646,19 @@ static void start_rx(SstvRx *s, const Mode *m, double t0, int kind, float off)
 
 static void process_period(SstvRx *s)
 {
-    int k = s->k, lost;
+    int k = s->k, lost, present;
     double W = search_window(s), pos, t;
     float q = find_sync(s, line_t(s, k), W, &pos);
     s->sync_seen++;
-    if (q >= SYNC_Q_MIN) { s->mgood[k] = 1; s->mpos[k] = pos - s->t_ref; s->sync_good++; s->miss_run = 0; }
-    else { s->mgood[k] = 0; s->miss_run++; }
+    present = s->sp_n > 0 && s->sp_ok * 100u >= s->sp_n * 60u
+              && !in_gap(s, line_t(s, k), line_t(s, k) + s->fb);   /* a gap holds its last tone: not picture */
+    s->sp_n = s->sp_ok = 0;
+    if (q >= SYNC_Q_MIN) { s->mgood[k] = 1; s->mpos[k] = pos - s->t_ref; s->sync_good++; s->miss_run = 0; s->absent_run = 0; }
+    else {
+        s->mgood[k] = 0; s->miss_run++;
+        /* Picture tones can outlast syncs in a fade. */
+        if (present) s->absent_run = 0; else s->absent_run++;
+    }
     fit_model(s);
     t = line_t(s, k);
     /* straighten: if the fit moved, re-time the periods already drawn. Done as
@@ -642,7 +680,7 @@ static void process_period(SstvRx *s)
     lost = (int)((s->start_kind == SSTV_START_VIS ? LOST_S_VIS : LOST_S_SYNC) / s->m->line);
     if (lost < 8) lost = 8;
     if (s->k >= s->nper) finish(s, SSTV_END_COMPLETE);
-    else if (s->miss_run >= lost) finish(s, SSTV_END_LOST);
+    else if ((s->weak ? s->absent_run : s->miss_run) >= lost) finish(s, SSTV_END_LOST);
 }
 
 /* ------------------------------------------------------------------ VIS */
@@ -688,6 +726,19 @@ static int vis_test(const SstvRx *s, uint32_t j, int *code, float *off, float *e
     return 1;
 }
 
+static int syncs_during(const SstvRx *s, double a, double b)
+{
+    int k;
+    if (s->state != SSTV_RX) return 0;
+    for (k = s->k - 1; k >= 0 && k < MAXP; k--) {
+        double t = s->mpos[k] + s->t_ref;
+        if (!s->mgood[k]) continue;
+        if (t < a) break;
+        if (t <= b) return 1;
+    }
+    return 0;
+}
+
 static void vis_bin_done(SstvRx *s, uint32_t j)
 {
     int code; float off, err;
@@ -703,7 +754,8 @@ static void vis_bin_done(SstvRx *s, uint32_t j)
         s->last_vis = s->vis_code;
         s->last_vis_ok = m != 0;
         s->revision++;
-        if (m && !(s->state == SSTV_RX && t_end < s->t_ref + 1.0 * s->Fs))
+        if (m && !(s->state == SSTV_RX && t_end < s->t_ref + 1.0 * s->Fs) &&
+            !syncs_during(s, t_end - .8 * s->Fs, t_end))
             start_rx(s, m, t_end + m->first * s->Fs * (1.0 + s->ppm_prior * 1e-6), SSTV_START_VIS, s->vis_off);
     }
 }
@@ -747,7 +799,7 @@ static int sync_len_ok(const SstvRx *s, const Mode *m, uint32_t edge)
     uint32_t pre = (uint32_t)iround((m->sync * 0.4 < 0.003 ? m->sync * 0.4 : 0.003) * s->Fs);
     uint32_t in0 = edge - Ls + Ls / 10u, in1 = edge - Ls / 10u;
     if (edge < Ls + g + pre + 1u) return 0;
-    if (sbits(s, in0, in1) * 10 < (int)(in1 - in0) * 7) return 0;
+    if (sbits(s, in0, in1) * 100 < (int)(in1 - in0) * (s->weak ? 55 : 70)) return 0;
     return sbits(s, edge - Ls - g - pre, edge - Ls - g) * 10 <= (int)pre * 3;
 }
 
@@ -786,6 +838,7 @@ static void autosync_try(SstvRx *s)
         const Mode *m = &MODES[mi];
         double Ls = m->sync * s->Fs, P = m->line * s->Fs * (1.0 + s->ppm_prior * 1e-6);
         int q, on = 1, first = s->npulses - 1, need = m->nshape ? 4 : 5;
+        if (s->selected && m != s->selected) continue;
         if (!sync_len_ok(s, m, np->edge)) continue;
         for (q = s->npulses - 2; q >= 0; q--) {
             const Pulse *pq = &s->pulses[q];
@@ -876,6 +929,13 @@ static void on_tone(SstvRx *s, float f)
         s->fh[i & s->fh_mask] = (uint8_t)(q <= 0.0f ? 0 : q >= 255.0f ? 255 : (int)q);
     }
     put_tone(s, i, f);
+    if (s->weak && s->state == SSTV_RX) {
+        float d = f - s->sp_prev;
+        if (d < 0) d = -d;
+        s->sp_prev = f;
+        s->sp_n++;
+        if (d < 60.0f) s->sp_ok++;
+    }
     s->n = i + 1;
     s->tone_ema += s->ema_a * (f - s->tone_ema);
 
@@ -906,6 +966,8 @@ SstvRx *sstv_new(int in_rate)
     s->in_rate = in_rate;
     s->D = (in_rate + 5512) / 11025; if (s->D < 1) s->D = 1;
     s->Fs = (double)in_rate / s->D;
+    s->ve = ve_new(s->Fs);
+    if (!s->ve) { D_FREE(s); return 0; }
 
     s->L = (int)(FIR_TAPS_44K * (double)in_rate / 44100.0 + 0.5) | 1;
     if (s->L < 15) s->L = 15;
@@ -959,12 +1021,55 @@ SstvRx *sstv_new(int in_rate)
     return s;
 }
 
+int sstv_set_mode(SstvRx *s, int code)
+{
+    const Mode *m = mode_by_vis(code);
+    if (!s || s->fed || (code != -1 && !m)) return 0;
+    s->selected = m;
+    return 1;
+}
+
+int sstv_set_weak(SstvRx *s, int on)
+{
+    double cutoff = on ? 900.0 : FIR_FCUT, sum = 0, wc;
+    int i;
+    if (!s || s->fed) return 0;
+    on = on != 0;
+    if (on == s->weak) return 1;
+    wc = 2 * cutoff / s->in_rate;
+    for (i = 0; i < s->L; i++) {
+        double x = i - s->M;
+        double w = .42 - .5 * m_cos(2 * PI_D * i / (s->L - 1)) + .08 * m_cos(4 * PI_D * i / (s->L - 1));
+        sum += w * (x == 0 ? wc : m_sin(PI_D * wc * x) / (PI_D * x));
+    }
+    for (i = 0; i <= s->M; i++) {
+        double x = i - s->M;
+        double w = .42 - .5 * m_cos(2 * PI_D * i / (s->L - 1)) + .08 * m_cos(4 * PI_D * i / (s->L - 1));
+        s->h[i] = (float)(w * (x == 0 ? wc : m_sin(PI_D * wc * x) / (PI_D * x)) / sum);
+    }
+    if (on) {
+        double w = PI_D * 450.0 / s->in_rate, K = m_sin(w) / m_cos(w), K2 = K * K;
+        int j;
+        for (j = 0; j < 2; j++) {
+            double q = j ? 1.30656296 : .54119610, norm = 1 / (1 + K / q + K2);
+            s->hp_b[j][0] = s->hp_b[j][2] = (float)norm;
+            s->hp_b[j][1] = (float)(-2 * norm);
+            s->hp_a[j][0] = (float)(2 * (K2 - 1) * norm);
+            s->hp_a[j][1] = (float)((1 - K / q + K2) * norm);
+        }
+    }
+    memset(s->hp_z, 0, sizeof s->hp_z);
+    s->weak = on;
+    return 1;
+}
+
 void sstv_free(SstvRx *s)
 {
     if (!s) return;
     /* reverse order of sstv_new, so a stack-like pool gives it all back */
     D_FREE(s->img); D_FREE(s->sb); D_FREE(s->lv); D_FREE(s->fh);
     D_FREE(s->bq); D_FREE(s->bi); D_FREE(s->h);
+    ve_free(s->ve);
     D_FREE(s);
 }
 
@@ -974,6 +1079,7 @@ void sstv_feed(SstvRx *s, const int16_t *x, int n, int stride)
     const float *h;
     float Fs2pi;
     if (!s || !x || n <= 0) return;
+    s->fed = 1;
     L = s->L; M = s->M; D = s->D; h = s->h;
     Fs2pi = (float)(s->Fs / (2.0 * PI_D));
     if (stride < 1) stride = 1;
@@ -981,7 +1087,17 @@ void sstv_feed(SstvRx *s, const int16_t *x, int n, int stride)
         float v = (float)x[(long)i * stride];
         int p = s->bpos;
         float lr = s->lo_re, li = s->lo_im;
-        float re = v * lr, im = v * li;
+        float re, im;
+        if (s->weak) {
+            int stage;
+            for (stage = 0; stage < 2; stage++) {
+                float y = s->hp_b[stage][0] * v + s->hp_z[stage][0];
+                s->hp_z[stage][0] = s->hp_b[stage][1] * v - s->hp_a[stage][0] * y + s->hp_z[stage][1];
+                s->hp_z[stage][1] = s->hp_b[stage][2] * v - s->hp_a[stage][1] * y;
+                v = y;
+            }
+        }
+        re = v * lr; im = v * li;
         s->lo_re = lr * s->lo_cr - li * s->lo_ci;
         s->lo_im = lr * s->lo_ci + li * s->lo_cr;
         s->bi[p] = s->bi[p + L] = re;
@@ -1012,6 +1128,13 @@ void sstv_feed(SstvRx *s, const int16_t *x, int n, int stride)
             di = zi * s->zr1 - zr * s->zi1;
             s->zr1 = zr; s->zi1 = zi;
             on_tone(s, (float)FC_HZ + f_atan2(di, dr) * Fs2pi);
+            if (s->state == SSTV_IDLE) {
+                const Mode *m; double end; float off;
+                if (ve_feed(s->ve, zr / 32768.0f, zi / 32768.0f, s->n, &m, &end, &off)) {
+                    s->last_vis = m->vis; s->last_vis_ok = 1;
+                    start_rx(s, m, end + m->first * s->Fs * (1 + s->ppm_prior * 1e-6), SSTV_START_VIS, off);
+                }
+            }
         }
     }
     if (s->state == SSTV_RX) redraw_step(s, RD_BUDGET);
@@ -1022,6 +1145,8 @@ void sstv_gap(SstvRx *s, int n)
     uint32_t t, g0;
     int k;
     if (!s || n <= 0) return;
+    s->fed = 1;
+    memset(s->hp_z, 0, sizeof s->hp_z);
     s->gaps += (unsigned long)n;
     t = (uint32_t)((s->dcount + n) / s->D);        /* tone samples the gap spans */
     s->dcount = (s->dcount + n) % s->D;
@@ -1035,6 +1160,7 @@ void sstv_gap(SstvRx *s, int n)
         float f = s->med2 < 1450.0f ? 1500.0f : s->med2;
         while (t--) on_tone(s, f);
     }
+    ve_reset(s->ve, s->n);
     if (s->state == SSTV_RX) redraw_step(s, RD_BUDGET);
 }
 

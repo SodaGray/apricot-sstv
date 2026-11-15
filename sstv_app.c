@@ -1,32 +1,31 @@
-/* SPDX-License-Identifier: GPL-3.0-only */
 /*
- * sstv_app.c -- Apricot SSTV: a NanoApps RAW-surface app that receives
- * slow-scan TV on the iPod nano 7th generation (RetailOS 1.1.2).
- * Modes: Robot 36/72, Martin M1/M2, Scottie S1/S2/DX, PD50/90/120/160/180/240/290.
+ * sstv_app.c -- NanoApps RAW app: SSTV receiver for the iPod nano 7
+ * (Robot 36/72, Martin M1/M2, Scottie S1/S2/DX, PD50/90/120/160/180/240/290)
+ * (RetailOS 1.1.2), on the apricot capture path.
  *
- *   capture DMA (44100, L == R) --nano_cap--> sstv_dsp (FPU lib) --> picture
+ *   capture DMA (44100, L == R) --nano_cap--> sstv_dsp (FPU lib) --> 320x240
  *
- * Landscape UI drawn into the portrait framebuffer: a 320x240 picture area
- * (larger pictures are scaled to fit) with a 112 px status/control strip.
+ * Landscape UI drawn into the portrait framebuffer: the picture is shown
+ * pixel-for-pixel (320x240) with a 112 px status/control strip beside it.
  *
- * Execution rules:
+ * Execution rules carried over from apricot:
  *   - all float work (the decoder) runs in hb_raw_frame, never hb_raw_init;
- *   - capture uses the system's wired capture device (the one Voice Memos
- *     uses). It is normally set up at boot; if not, LISTEN says so, and
- *     rebooting and opening Voice Memos once sets it up. The app installs no
- *     firmware callback and starts no thread; it only calls the device's
- *     start method and reads the DMA buffers.
+ *     the decoder is created on the first frame;
+ *   - capture needs the device primed: record once in Voice Memos per boot.
+ * Unlike the modem this app installs NO firmware callback and starts no
+ * thread: it only calls device-start and reads the DMA halves, so leaving
+ * without STOP can't crash anything.
  *
- * Memory: code + .bss is kept small (~465 KB: picture view, strip shadow,
- * fonts). A large .bss (~1 MB) crashed the system part-way through long
- * pictures, so the decoder takes one fixed 540 KB block from the OS heap at
- * LISTEN (only with 1 MB to spare) and gives it back at STOP; see
- * sstv_support.c. REC borrows 1 MB the same way. The strip shows the OS
- * heap's free space.
+ * Memory (rev9): .bss stays ~425 KB (view, strip shadow, fonts), as in rev6.
+ * rev7/rev8 put the decoder there too (~1.0 MB of code + .bss) and crashed
+ * at a fixed point in long pictures; see sstv_support.c. The decoder takes
+ * one fixed 540 KB block from the OS heap at LISTEN (only with 1.5 MB free)
+ * and gives it back at STOP. REC borrows 1 MB the same way. The strip shows
+ * the OS heap's free space.
  *
  * Frame budget: nano_cap reads the DMA's live position, so frame gaps up to
- * ~45 ms lose nothing (UI frames measured 16-31 ms on the device). Longer
- * stalls are counted (LOST) and the decoder's timeline is kept exact.
+ * ~45 ms lose nothing (apricot measured 31 ms worst). Longer stalls are
+ * counted (LOST) and the decoder's timeline is kept exact.
  */
 #include "hb_sdk.h"
 #include "hb_heap.h"
@@ -41,10 +40,12 @@
 #include <stdint.h>
 
 /* OS heap headroom: REC (1 MB) only with this much left over, BMP save only
- * above SAVE_FLOOR (the file system takes heap while writing). The OS
- * allocator panics rather than failing when it runs out. */
+ * above SAVE_FLOOR (the file system takes heap while writing). Morse Key found
+ * the OS needs ~512 KB to play a sound safely. */
 #define REC_FLOOR   (1024u * 1024u)
 #define SAVE_FLOOR  (512u * 1024u)
+#define SSTV_DIR "/Data/Apricot/SSTV"
+#define RECORD_PATH SSTV_DIR "/SSTVCAP.WAV"
 /* breadcrumbs while listening (./start trace shows the last 48 after a crash):
  *   TICK  a = seconds since the last touch << 16 | slowest frame interval, ms
  *         b = frames in the window << 16 | most work in one frame, ms
@@ -54,6 +55,7 @@
 #define TICK_US      10000000u
 #define HEAP_POLL_US  1000000u          /* hb_os_heap_free at most once a second */
 
+void *sstv_pool_base(void);        /* sstv_support.c: the decoder pool (OS heap) */
 int   sstv_pool_open(void);
 void  sstv_pool_close(void);
 #define POOL_FLOOR  (1024u * 1024u)    /* OS heap to leave free after taking the pool */
@@ -83,9 +85,10 @@ static int g_rot;               /* which way the iPod is turned */
 #define PANEL_X 322
 
 /* ---- what reaches the framebuffer, and how often ----
- * On the device the framebuffer appears to be uncached memory the display
- * DMA reads, so every store is slow: rewriting all ~250k pixels each frame
- * took up to 131 ms, longer than the 46 ms capture ring, and lost audio. So:
+ * On the device the framebuffer is (as far as we can tell) uncached memory the
+ * display DMA reads, so every store is slow, and rev1/rev2 rewrote all ~250k
+ * pixels each frame: frames took up to 131 ms, longer than the 46 ms capture
+ * ring, and audio was lost. Now:
  *   - the status strip (landscape x >= 320, 112 x 240) is drawn into a cached
  *     shadow, and only 16-px segments that changed are copied out;
  *   - picture rows are copied out only when their contents changed;
@@ -155,11 +158,11 @@ static void lchar(int x, int y, int sc, char ch, uint32_t c)
             if (g[r] & (1u << (4 - col))) lfill(x + col * sc, y + r * sc, sc, sc, c);
 }
 
-/* ---- text: GSF1 bitmap fonts from /Apps/Data/Fonts, 5x7 fallback ----
- * Two roles, each with its own candidate files (font_io.h), read by gsf.c.
- * A character the font lacks is drawn in the built-in 5x7, sitting on the
- * font's baseline; a role with no font at all is drawn entirely in 5x7
- * (scale 1 for UI, 2 for the title). */
+/* ---- text: the user's GSF1 fonts from /Apps/Data/Fonts, 5x7 fallback ----
+ * Two roles, each with its own candidate files (font_io.h). gsf.c is Morse
+ * Key's reader. As in Morse Key, a character the font lacks is drawn in the
+ * built-in 5x7, sitting on the font's baseline; a role with no font at all is
+ * drawn entirely in 5x7 (scale 1 for UI, 2 for the title). */
 enum { FONT_UI = 0, FONT_TITLE = 1 };
 static Gsf  g_font[2];
 static int  g_font_ok[2], g_fonts_tried;
@@ -279,6 +282,9 @@ static uint32_t g_touch_t, g_tick_t, g_tick_n, g_tick_frames, g_tick_fmax, g_tic
 static NanoCap  g_cap;
 static int      g_listening;
 static int      g_autosave = 1;
+static int      g_weak;
+static const int g_modes[] = {-1, 8, 12, 44, 40, 60, 56, 76, 93, 99, 95, 98, 96, 97, 94};
+static int      g_mode;
 static unsigned long g_images_seen, g_saved;
 static int      prev_down;
 #define MSG_MAX 31              /* (drawn clipped to the strip width) */
@@ -303,7 +309,7 @@ static uint32_t now_us(void) { return (uint32_t)hb_time_uptime_us(); }
  * clock, over a window of a few seconds. It should read ~44100; anything else
  * means the codec isn't running at the rate everything here assumes.
  * REC records 12 s of exactly what the decoder is fed (gaps as silence) and
- * writes /SSTVCAP.WAV, for sstv_decode / inspection on the Mac. */
+ * writes RECORD_PATH, for sstv_decode / inspection on the Mac. */
 #define REC_FRAMES (12u * NCAP_RATE)
 static int16_t *g_rec;
 static uint32_t g_rec_n;
@@ -319,6 +325,13 @@ static void rec_put(const int16_t *x, int n)
     if (!g_rec) return;
     for (i = 0; i < n && g_rec_n < REC_FRAMES; i++) g_rec[g_rec_n++] = x ? x[i] : 0;
 }
+
+static int output_dir_ready(void)
+{
+    return hb_fs_mkdir("/Data") && hb_fs_mkdir("/Data/Apricot") &&
+           hb_fs_mkdir(SSTV_DIR);
+}
+
 static void rec_finish(void)
 {
     uint8_t h[44];
@@ -337,7 +350,7 @@ static void rec_finish(void)
     h[36] = 'd'; h[37] = 'a'; h[38] = 't'; h[39] = 'a';
     for (i = 0, v = bytes; i < 4; i++, v >>= 8) h[40 + i] = (uint8_t)v;
     hb_trace_log("REC", g_rec_n, 0);
-    ok = hb_fs_stream_open("/SSTVCAP.WAV") && hb_fs_stream_write(h, 44u);
+    ok = output_dir_ready() && hb_fs_stream_open(RECORD_PATH) && hb_fs_stream_write(h, 44u);
     for (off = 0; ok && off < bytes; off += 32768u) {            /* write in 32 KB pieces */
         uint32_t n = bytes - off < 32768u ? bytes - off : 32768u;
         ok = hb_fs_stream_write((const uint8_t *)g_rec + off, n);
@@ -472,11 +485,8 @@ static void on_gap(void *u, int n)
     (void)u;
     rec_put(0, n);
     if (!g_rx) return;
-    /* keep the picture's timing exact (cheap: no filtering of silence). Only
-     * a very long stall drops the picture, and even then the decoder resumes
-     * it if its syncs come back on the same line grid. */
-    if (n > 30 * (int)NCAP_RATE) sstv_abort(g_rx);
-    else sstv_gap(g_rx, n);
+    if (n > 2 * (int)NCAP_RATE) sstv_abort(g_rx);     /* asleep for seconds: drop the image */
+    else sstv_gap(g_rx, n);                            /* keep the picture's timing exact */
 }
 
 static void view_update(void);
@@ -503,6 +513,19 @@ static void listen_start(void)
     }
     g_rx = sstv_new((int)g_dec_rate);
     if (!g_rx) { sstv_pool_close(); say("Decoder:", "no memory (pool)", C_ERR); return; }
+    {   /* memory map, once: is our .bss clear of the OS heap? (MEMB's probe
+         * block must not land inside MEMA's range) */
+        static int logged;
+        if (!logged) {
+            void *pr = hb_os_alloc(64);
+            logged = 1;
+            hb_trace_log("MEMA", (uint32_t)(uintptr_t)sstv_pool_base(), (uint32_t)(uintptr_t)sstv_pool_base() + SSTV_MEM_BYTES);
+            hb_trace_log("MEMB", (uint32_t)(uintptr_t)pr, (uint32_t)(uintptr_t)g_view);
+            if (pr) hb_os_free(pr);
+        }
+    }
+    sstv_set_weak(g_rx, g_weak);
+    sstv_set_mode(g_rx, g_modes[g_mode]);
     if (g_ppm_known) sstv_set_ppm_prior(g_rx, g_ppm_prior);
     g_images_seen = 0;
     ncap_init(&g_cap, ncap_nano_bus());
@@ -510,7 +533,7 @@ static void listen_start(void)
     r = ncap_arm(&g_cap, now_us());
     if (r == NCAP_E_NOTPRIMED) {
         sstv_free(g_rx); g_rx = 0; sstv_pool_close();
-        say("Not ready: reboot", "then Voice Memos", C_WARN);
+        say("Not primed:", "Voice Memos first", C_WARN);
         return;
     }
     g_listening = 1;
@@ -621,7 +644,7 @@ static int save_bmp(void)
 {
     static uint8_t chunk[8 * SSTV_MAX_W * 3];
     uint8_t h[54];
-    char path[24], *p;
+    char path[sizeof(SSTV_DIR "/SSTV_4294967.BMP")], *p;
     const uint16_t *src = 0;
     int W = SSTV_W, H = SSTV_H, y, x, i, k, ok;
     uint32_t v, rowb, size;
@@ -645,7 +668,11 @@ static int save_bmp(void)
     h[22] = (uint8_t)(H & 255); h[23] = (uint8_t)(H >> 8);
     h[26] = 1; h[28] = 24;
     for (i = 0, v = rowb * (uint32_t)H; i < 4; i++, v >>= 8) h[34 + i] = (uint8_t)v;
-    p = put_s(path, "/SSTV_");
+    if (!output_dir_ready()) {
+        say("Save failed", SSTV_DIR, C_ERR);
+        return 0;
+    }
+    p = put_s(path, SSTV_DIR "/SSTV_");
     p = put_u(p, (uint32_t)hb_time_uptime_ms() / 1000u);
     put_s(p, ".BMP");
     hb_trace_log("SAVE", g_saved, (uint32_t)(W * 1000 + H));
@@ -662,8 +689,8 @@ static int save_bmp(void)
         ok = hb_fs_stream_write(chunk, (uint32_t)k * rowb);
     }
     ok = hb_fs_stream_close() && ok;
-    if (ok) { g_saved++; say("Saved", path + 1, C_OK); }
-    else say("Save failed", path + 1, C_ERR);
+    if (ok) { g_saved++; say("Saved", path + sizeof(SSTV_DIR), C_OK); }
+    else say("Save failed", path + sizeof(SSTV_DIR), C_ERR);
     return ok;
 }
 
@@ -791,6 +818,7 @@ static void audio_poll(void)
                     g_rx = sstv_new((int)want);
                     if (g_rx) { g_dec_rate = want; g_images_seen = 0; say("Rate adjusted:", "decoder rebuilt", C_WARN); }
                     else { g_rx = sstv_new((int)g_dec_rate); say("Rate off, no memory", "", C_ERR); }
+                    if (g_rx) { sstv_set_weak(g_rx, g_weak); sstv_set_mode(g_rx, g_modes[g_mode]); }
                     if (g_rx && g_ppm_known) sstv_set_ppm_prior(g_rx, g_ppm_prior);
                 }
             }
@@ -865,7 +893,7 @@ void hb_raw_frame(const hb_spoint_t *t)
         hb_trace_log("TICK", (idle > 0xFFFFu ? 0xFFFFu : idle) << 16 | (fm > 0xFFFFu ? 0xFFFFu : fm),
                      (g_tick_frames > 0xFFFFu ? 0xFFFFu : g_tick_frames) << 16 | (wm > 0xFFFFu ? 0xFFFFu : wm));
         hb_trace_log("DEC", (uint32_t)st.state << 28 | (uint32_t)(st.last_vis >= 0 ? st.last_vis & 0xFF : 0xFF) << 16 |
-                     ((uint32_t)st.line & 0xFFFFu), (uint32_t)(st.images & 0xFFFFu) << 16 | (uint32_t)(st.relocks & 0xFF) << 8 | sy);
+                     ((uint32_t)st.line & 0xFFFFu), (uint32_t)(st.images & 0xFFFFu) << 16 | sy);
         if (++g_tick_n % 3u == 0u) hb_trace_log("HEAP", g_heap, g_heap_min);
         g_tick_frames = 0; g_tick_fmax = 0; g_tick_wmax = 0;
     }
@@ -895,7 +923,8 @@ void hb_raw_frame(const hb_spoint_t *t)
         int lh = ui_line_h(FONT_UI), th = ui_line_h(FONT_TITLE);
         int sh = lh + 4 > 20 ? lh + 4 : 20, bh = th + 4 > 24 ? th + 4 : 24;   /* button heights */
         int r3 = SSTV_H - 2 - sh, r2 = r3 - 3 - sh, r1 = r2 - 4 - bh;        /* rows, bottom up */
-        int i, total, top;
+        int i, total, top, rm = r1 - 3 - sh;
+        char mode_label[24];
 
         ui_text(X, 2, FONT_TITLE, ui_text_w(FONT_TITLE, APP_NAME) <= PW ? APP_NAME : APP_SHORT, C_FG, PW);
         top = 2 + th + 2;
@@ -916,7 +945,7 @@ void hb_raw_frame(const hb_spoint_t *t)
             p = put_s(ln_add(9, C_FG), st.mode ? st.mode : "?");
             put_s(p, st.start_kind == SSTV_START_VIS ? " VIS" : " sync");
         }
-        else put_s(ln_add(9, C_DIM), "Waiting for VIS");
+        else put_s(ln_add(9, C_DIM), g_mode ? "Waiting for sync" : "Waiting for VIS");
         p = ln_add(7, C_DIM);                                    /* sync + offset */
         p = put_s(p, "Sync ");
         p = put_u(p, st.sync_seen ? (uint32_t)(st.sync_good * 100 / st.sync_seen) : 0u);
@@ -964,7 +993,7 @@ void hb_raw_frame(const hb_spoint_t *t)
             int lo = -1;
             for (total = 0, i = 0; i < g_nl; i++)
                 if (g_ln[i].prio >= 0) total += g_ln[i].bar ? 16 : lh;
-            if (top + total <= r1 - 2) break;
+            if (top + total <= rm - 2) break;
             for (i = 0; i < g_nl; i++)
                 if (g_ln[i].prio >= 0 && (lo < 0 || g_ln[i].prio < g_ln[lo].prio)) lo = i;
             if (lo < 0) break;
@@ -980,6 +1009,13 @@ void hb_raw_frame(const hb_spoint_t *t)
 
         /* ---- controls ---- */
         if (down) touch_l(t, &tx, &ty);
+        put_s(put_s(mode_label, "Mode "), g_mode ? sstv_vis_name(g_modes[g_mode]) : "Auto");
+        if (button(down, press, tx, ty, X, rm, PW, sh, mode_label, FONT_UI, g_mode ? C_BTN_ON : C_BTN)) {
+            int restart = g_listening;
+            if (restart) listen_stop();
+            g_mode = (g_mode + 1) % (int)(sizeof g_modes / sizeof g_modes[0]);
+            if (restart) listen_start();
+        }
         if (button(down, press, tx, ty, X, r1, PW, bh, g_listening ? "Stop" : "Listen", FONT_TITLE,
                    g_listening ? C_BTN_ON : C_BTN)) {
             if (g_listening) listen_stop(); else listen_start();
@@ -994,9 +1030,16 @@ void hb_raw_frame(const hb_spoint_t *t)
             g_have_still = 0; g_src_w = g_src_h = 0;     /* (not listening: the splash comes back) */
             say("Cleared", "", C_DIM);
         }
-        if (button(down, press, tx, ty, X, r3, 52, sh, g_autosave ? "Auto on|Auto" : "Auto off|Man", FONT_UI,
+        if (button(down, press, tx, ty, X, r3, 34, sh, g_autosave ? "Auto on|Auto" : "Auto off|Man", FONT_UI,
                    g_autosave ? C_BTN_ON : C_BTN)) g_autosave = !g_autosave;
-        if (button(down, press, tx, ty, X + 54, r3, 52, sh, "Rotate|Rot", FONT_UI, C_BTN)) g_rot = !g_rot;
+        if (button(down, press, tx, ty, X + 36, r3, 34, sh, "Weak|Wk", FONT_UI,
+                   g_weak ? C_BTN_ON : C_BTN)) {
+            int restart = g_listening;
+            if (restart) listen_stop();
+            g_weak = !g_weak;
+            if (restart) listen_start();
+        }
+        if (button(down, press, tx, ty, X + 72, r3, 34, sh, "Rotate|Rot", FONT_UI, C_BTN)) g_rot = !g_rot;
     }
 
     /* ---- out to the framebuffer: only what changed ---- */

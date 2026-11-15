@@ -3,7 +3,7 @@
  * the iPod runs (sstv_dsp.c). Writes every image it finishes, plus the one in
  * progress at the end of the file.
  *
- *   sstv_decode recording.wav [out_prefix] [--no-autosync] [--ppm N] [--rate HZ]
+ *   sstv_decode recording.wav [out_prefix] [--no-autosync] [--ppm N] [--rate HZ] [--weak] [--mode VIS]
  *
  * --rate overrides the WAV header: the iPod's SSTVCAP.WAV always says 44100;
  * if the app showed a different capture rate, decode with that.
@@ -33,7 +33,7 @@ static const char *end_name(int k)
 int main(int argc, char **argv)
 {
     const char *in = 0, *prefix = "sstv";
-    int i, ch, rate, autosync = 1, nimg = 0, have_ppm = 0, ppm = 0, force_rate = 0;
+    int i, ch, rate, autosync = 1, nimg = 0, have_ppm = 0, ppm = 0, force_rate = 0, weak = 0, mode = -1;
     long frames, f;
     int16_t *x;
     SstvRx *s;
@@ -41,19 +41,23 @@ int main(int argc, char **argv)
     char path[1024];
 
     for (i = 1; i < argc; i++) {
-        if (!strcmp(argv[i], "--no-autosync")) autosync = 0;
+        if (!strcmp(argv[i], "--mode") && i + 1 < argc) mode = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--weak")) weak = 1;
+        else if (!strcmp(argv[i], "--no-autosync")) autosync = 0;
         else if (!strcmp(argv[i], "--ppm") && i + 1 < argc) { ppm = atoi(argv[++i]); have_ppm = 1; }
         else if (!strcmp(argv[i], "--rate") && i + 1 < argc) force_rate = atoi(argv[++i]);
         else if (!in) in = argv[i];
         else prefix = argv[i];
     }
-    if (!in) { fprintf(stderr, "usage: %s in.wav [out_prefix] [--no-autosync] [--ppm N] [--rate HZ]\n", argv[0]); return 2; }
+    if (!in) { fprintf(stderr, "usage: %s in.wav [out_prefix] [--no-autosync] [--ppm N] [--rate HZ] [--weak] [--mode VIS]\n", argv[0]); return 2; }
     x = wav_read(in, &frames, &ch, &rate);
     if (!x) { fprintf(stderr, "%s: can't read (PCM 16/24/32-bit or float WAV)\n", in); return 1; }
     if (force_rate > 0) { printf("(header says %d Hz; decoding as %d Hz)\n", rate, force_rate); rate = force_rate; }
     printf("%s: %d Hz, %d ch, %.1f s (decoding channel 1)\n", in, rate, ch, (double)frames / rate);
     s = sstv_new(rate);
     if (!s) { fprintf(stderr, "decoder: rate %d unsupported or out of memory\n", rate); return 1; }
+    if (!sstv_set_mode(s, mode)) { fprintf(stderr, "unsupported mode: %d\n", mode); sstv_free(s); free(x); return 2; }
+    sstv_set_weak(s, weak);
     sstv_set_autosync(s, autosync);
     if (have_ppm) sstv_set_ppm_prior(s, ppm);
     sstv_status(s, &P);

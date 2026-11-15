@@ -1,6 +1,5 @@
-/* SPDX-License-Identifier: GPL-3.0-only */
 /* host stub of the NanoApps SDK surface sstv_app.c uses -- for compile checks
- * and the UI preview only. Signatures as the app calls them. */
+ * and the UI preview only. Signatures as apricot's apps call them. */
 #ifndef HB_SDK_STUB_H
 #define HB_SDK_STUB_H
 #include <stdint.h>
@@ -9,6 +8,7 @@ uint64_t hb_time_uptime_us(void);
 uint32_t hb_time_uptime_ms(void);
 void hb_trace_init(void);
 void hb_trace_log(const char *tag, uint32_t a, uint32_t b);
+int  hb_fs_mkdir(const char *path);
 int  hb_fs_stream_open(const char *path);
 int  hb_fs_stream_write(const void *buf, uint32_t len);
 int  hb_fs_stream_close(void);

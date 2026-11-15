@@ -5,21 +5,28 @@
 CC      ?= cc
 CFLAGS  ?= -std=c99 -O2 -g -Wall -Wextra -Wno-unused-parameter -D_DEFAULT_SOURCE
 CORE     = ../sstv_dsp.c
-BINS     = sstv_decode sstv_tx test_dsp test_cap preview_app
+CORE_HEADERS = ../sstv_dsp.h ../sstv_vis.h
+BINS     = sstv_decode sstv_tx test_dsp test_cap test_weak test_mode preview_app
 
 all: $(BINS)
 
-sstv_decode: sstv_decode.c util.c $(CORE) ../sstv_dsp.h
+sstv_decode: sstv_decode.c util.c $(CORE) $(CORE_HEADERS)
 	$(CC) $(CFLAGS) -o $@ sstv_decode.c util.c $(CORE) -lm
 sstv_tx: sstv_tx.c enc.c util.c
 	$(CC) $(CFLAGS) -o $@ sstv_tx.c enc.c util.c -lm
-test_dsp: test_dsp.c enc.c util.c $(CORE) ../sstv_dsp.h
+test_dsp: test_dsp.c enc.c util.c $(CORE) $(CORE_HEADERS)
 	$(CC) $(CFLAGS) -o $@ test_dsp.c enc.c util.c $(CORE) -lm
-test_cap: test_cap.c ../nano_cap.c ../nano_cap.h enc.c util.c $(CORE)
+test_weak: test_weak.c enc.c $(CORE) $(CORE_HEADERS) ../sstv_support.c
+	$(CC) $(CFLAGS) -DSSTV_POOL -o $@ test_weak.c enc.c $(CORE) ../sstv_support.c -lm
+
+test_mode: test_mode.c enc.c $(CORE) $(CORE_HEADERS)
+	$(CC) $(CFLAGS) -o $@ test_mode.c enc.c $(CORE) -lm
+
+test_cap: test_cap.c ../nano_cap.c ../nano_cap.h enc.c util.c $(CORE) $(CORE_HEADERS)
 	$(CC) $(CFLAGS) -o $@ test_cap.c ../nano_cap.c enc.c util.c $(CORE) -lm
 
 # the app as on the nano: decoder in the static pool (-DSSTV_POOL, ../sstv_support.c)
-preview_app: preview_app.c ../sstv_app.c ../nano_cap.c ../gsf.c ../sstv_support.c ../sstv_font5x7.h font_io_host.c enc.c util.c $(CORE)
+preview_app: preview_app.c ../sstv_app.c ../nano_cap.c ../gsf.c ../sstv_support.c ../sstv_font5x7.h font_io_host.c enc.c util.c $(CORE) $(CORE_HEADERS)
 	$(CC) $(CFLAGS) -Wno-misleading-indentation -Istub_sdk -I.. -DAPRICOT_NANO -c ../sstv_app.c -o sstv_app_host.o
 	$(CC) $(CFLAGS) -I.. -DSSTV_POOL -c $(CORE) -o sstv_dsp_pool.o
 	$(CC) $(CFLAGS) -I.. -c ../sstv_support.c -o sstv_support_host.o
@@ -27,7 +34,7 @@ preview_app: preview_app.c ../sstv_app.c ../nano_cap.c ../gsf.c ../sstv_support.
 
 # hours of hostile audio into the decoder under ASan/UBSan (not part of `make test`):
 #   make fuzz_dsp && ./fuzz_dsp . 3600 1
-fuzz_dsp: fuzz_dsp.c enc.c util.c $(CORE) ../sstv_dsp.h
+fuzz_dsp: fuzz_dsp.c enc.c util.c $(CORE) $(CORE_HEADERS)
 	$(CC) -std=c99 -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer -Wall -D_DEFAULT_SOURCE -o $@ fuzz_dsp.c enc.c util.c $(CORE) -lm
 
 # test fonts in GSF1 (needs Pillow + DejaVu): ui.gsf 11 px, title.gsf 17 px
@@ -48,6 +55,8 @@ $(IMAGES): tools/make_testcard.py
 test: $(BINS) $(IMAGES) out
 	./test_dsp . out
 	./test_cap photo.ppm out
+	./test_weak
+	./test_mode
 	./preview_app photo.ppm out
 
 clean:

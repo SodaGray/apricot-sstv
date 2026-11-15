@@ -19,6 +19,7 @@
  *   decimate by D  ->  FM discriminator arg(z[m] z*[m-1])  ->  tone in Hz
  *   tone -> level ring (uint8, 1500..2300 Hz = 0..255) + sync-bit ring
  *   tone -> 1 ms bins -> VIS detector (leader offset = tuning correction)
+ *   idle I/Q -> coherent tone energies -> additional VIS detector
  *
  * Re-timing reaches back as far as the level ring (~12 s); lines older than
  * that keep the timing they were drawn with (by then the fit has settled).
@@ -30,8 +31,8 @@
  * (SSTV_MEM_BYTES at most, for any input rate up to 48000): 128 KiB level ring
  * (11.9 s at Fs = 11025), 16 KiB sync bits, 64 KiB tone history, 300 KiB
  * picture (RGB565, with the Robot 36 line data in its tail) and ~15 KiB of
- * state. The picture is stored at most SSTV_MAX_W x SSTV_MAX_H: modes wider
- * than that (PD120/160/180/240/290) are stored at half size, which is still more
+ * state, plus ~13 KiB for coherent VIS, all within the same pool. The picture
+ * is stored at most SSTV_MAX_W x SSTV_MAX_H: modes wider than that (PD120/160/180/240/290) are stored at half size, which is still more
  * than the nano's 320x240 picture area shows.
  */
 #ifndef SSTV_DSP_H
@@ -74,6 +75,12 @@ typedef struct SstvRx SstvRx;
 /* in_rate: input sample rate (Hz). NULL on OOM or a rate below 8000. */
 SstvRx *sstv_new(int in_rate);
 void    sstv_free(SstvRx *s);
+/* Optional 900 Hz low-pass + 450 Hz high-pass and weak-sync tolerance.
+ * Set before feeding audio. Default off. */
+int     sstv_set_weak(SstvRx *s, int on);
+
+/* Restrict reception to a VIS mode, or -1 for automatic selection. Set before feeding. */
+int sstv_set_mode(SstvRx *s, int code);
 
 /* Feed n input samples, taking every `stride`-th s16 (stride 2 = left channel
  * of interleaved stereo, as the nano's capture DMA delivers). */

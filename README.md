@@ -13,12 +13,19 @@ a picture through fades and capture gaps.
 |---|---|
 | ![Apricot SSTV receiving a Robot 36 picture](docs/screenshots/robot36.bmp) | ![Apricot SSTV receiving a PD240 picture](docs/screenshots/pd240.bmp) |
 
+## Changes in 1.1
+
+- Improved decoding algorithms and weak-signal performance.
+- Added manual SSTV mode selection.
+
 ## Features
 
 - **14 modes:** Robot 36/72, Martin M1/M2, Scottie S1/S2/DX, and every PD
   mode from PD50 to PD290, including PD120 (the ISS's usual mode).
 - **Automatic start:** reads the VIS header and its tuning offset (±150 Hz),
   or locks onto any supported mode's sync pulses when the VIS was missed.
+- **Weak signals:** a compact coherent VIS fallback, plus an optional `Weak`
+  mode with a narrower receive filter and more tolerant sync acquisition.
 - **Slant correction:** fits the line period to the received syncs, reports
   the sender's clock error in ppm, and straightens lines already drawn. The
   measured error carries over to the next picture.
@@ -108,9 +115,11 @@ version and website.
 |---|---|
 | Listen / Stop | start or stop receiving |
 | Save | save the current picture as BMP |
-| Rec | record the next 12 s of raw input to `/SSTVCAP.WAV` (tap again to stop early) |
+| Rec | record the next 12 s of raw input to `/Data/Apricot/SSTV/SSTVCAP.WAV` (tap again to stop early) |
 | Clear | clear the picture |
 | Auto on / off | save each finished picture automatically |
+| Weak | toggle weak-signal processing; changing it restarts listening |
+| Mode Auto | cycle through Auto and the 14 supported receive modes; changing it restarts listening |
 | Rotate | flip the screen for the other landscape orientation |
 
 ### The status strip
@@ -159,7 +168,7 @@ picture.
 | fonts | `font_io.h` | the candidate file lists |
 
 The start-screen title is `APP_NAME " RX v" APP_VERSION`, for example
-"Apricot SSTV RX v1.0". The folder, executable and bundle ID are `sstvrx`
+"Apricot SSTV RX v1.1". The folder, executable and bundle ID are `sstvrx`
 and `org.apricot.sstvrx`.
 
 ## Fonts
@@ -224,6 +233,19 @@ exactly. The capture is polled three times per UI frame.
 
 ### Decoder
 
+The coherent VIS fallback runs only while waiting for a picture. It uses the
+existing decimated I/Q stream, 20 ms float accumulators rebased once a second,
+and 2 ms energy bins normalized to bytes. Its 40 frequency bins and buffers
+fit within the existing 540 KiB decoder pool. It introduces no libm dependency.
+
+`Weak` enables a 900 Hz complex low-pass and a 450 Hz high-pass, accepts more
+imperfect sync pulses, and carries on when picture tones remain despite lost
+syncs. The default 1500 Hz filter preserves clean-signal detail. Both settings
+retain the nano's half-size modes and short history ring. Robot 36 separators
+vote on chroma parity with budgeted redraws, and an active picture's syncs guard
+against false VIS. `Mode Auto` cycles through Auto and all supported modes;
+a selected mode accepts matching VIS headers or starts on its line syncs.
+
 - **Start:** the VIS header gives the mode and the tuning offset. Without a
   VIS, the decoder looks for 4 ms sync pulses that fall on one mode's line
   grid (4 or more pulses, missing ones allowed) and checks those lines' porch
@@ -284,16 +306,18 @@ line).
 ```sh
 cd host
 make            # sstv_decode, sstv_tx, test_dsp, test_cap, preview_app
-make test       # decoder tests, capture-drain simulation, UI preview
+make test       # decoder, weak-signal/pool checks, capture simulation, UI preview
 ```
 
 | Tool | What |
 |---|---|
 | `sstv_tx in.ppm out.wav [--mode VIS] [--skew PPM] [--offset HZ] [--snr DB] [--novis]` | encode a picture as an SSTV WAV (resized to the mode) |
-| `sstv_decode in.wav prefix [--rate R] [--ppm PPM] [--no-autosync]` | decode a WAV with the same decoder |
+| `sstv_decode in.wav prefix [--rate R] [--ppm PPM] [--no-autosync] [--weak] [--mode VIS]` | decode a WAV with the same decoder |
 | `test_dsp . out` | 66 decoder cases: every mode clean and with clock skew, offset and noise; starts without VIS; low SNR, fading, sample rates, gaps; a false-start run; back-to-back modes; fades and gaps mid-picture |
+| `test_mode` | manual reception for all 14 modes without VIS; matching/mismatched VIS and mode isolation |
+| `test_weak` | weak-signal modes, clock/rate boundaries, fixed-pool limit and cleanup |
 | `test_cap photo.ppm out` | the capture drain against a simulated DMA, checking every delivered sample |
-| `preview_app photo.ppm out` | the real `sstv_app.c` against a stub SDK; writes screens to `out/ui_*.ppm` and the BMPs the app saves. `MODE=<VIS>` picks the mode; `WAVIN=<file>` uses a WAV as the microphone |
+| `preview_app photo.ppm out` | the real `sstv_app.c` against a stub SDK; writes screens to `out/ui_*.ppm` and the BMPs the app saves. `MODE=<VIS>` picks the mode; `WEAK=1` enables weak processing; `RXMODE=<VIS>` selects the receive mode; `WAVIN=<file>` uses a WAV as the microphone |
 | `fuzz_dsp . <seconds> <seed>` | `make fuzz_dsp`: hostile audio into the decoder under AddressSanitizer |
 | `tools/make_testcard.py` | the test images |
 
@@ -329,7 +353,7 @@ time.
 | worst gap (`…ms`) | under 45 | above ~45 ms, audio is lost (`lost` climbs) |
 
 **REC** saves the next 12 s of exactly what the decoder hears to
-`/SSTVCAP.WAV`. Decode it on a PC with `host/sstv_decode SSTVCAP.WAV out`
+`/Data/Apricot/SSTV/SSTVCAP.WAV`. Decode it on a PC with `host/sstv_decode SSTVCAP.WAV out`
 (add `--rate <rate>` if the strip showed a rate other than 44100).
 
 **Trace breadcrumbs:** while listening, the app writes to the NanoApps trace
